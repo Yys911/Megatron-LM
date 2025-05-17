@@ -80,11 +80,11 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             rotary_interleaved,
             seq_len_interpolation_factor,
             rotary_base,
-            use_cpu_initialization,
+            use_cpu_initialization=use_cpu_initialization,
         )
 
     @lru_cache(maxsize=32)
-    def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
+    def forward(self, max_seq_len: int, offset: int = 0, test_device = 'gpu') -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
@@ -98,13 +98,14 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             not self.rotary_interleaved
         ), "Yarn RoPE does not support interleaved rotary embeddings"
 
-        if self.inv_freq_extra.device.type == 'cpu':
-            # move `inv_freq_extra` to GPU once at the first micro-batch forward pass
-            self.inv_freq_extra = self.inv_freq_extra.to(device=torch.cuda.current_device())
+        if test_device == 'gpu':
+            if self.inv_freq_extra.device.type == 'cpu':
+                # move `inv_freq_extra` to GPU once at the first micro-batch forward pass
+                self.inv_freq_extra = self.inv_freq_extra.to(device=torch.cuda.current_device())
 
-        if self.inv_freq_inter.device.type == 'cpu':
-            # move `inv_freq_inter` to GPU once at the first micro-batch forward pass
-            self.inv_freq_inter = self.inv_freq_inter.to(device=torch.cuda.current_device())
+            if self.inv_freq_inter.device.type == 'cpu':
+                # move `inv_freq_inter` to GPU once at the first micro-batch forward pass
+                self.inv_freq_inter = self.inv_freq_inter.to(device=torch.cuda.current_device())
 
         low, high = _yarn_find_correction_range(
             self.beta_fast,

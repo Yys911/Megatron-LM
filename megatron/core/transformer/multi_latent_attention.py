@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
+from torch.nn import RMSNorm
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings import (
@@ -24,7 +25,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import deprecate_inference_params
-
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 
 @dataclass
 class MLASelfAttentionSubmodules:
@@ -88,6 +89,7 @@ class MultiLatentAttention(Attention):
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
                 rotary_base=self.config.rotary_base,
+                use_cpu_initialization=config.use_cpu_initialization
             )
         elif self.config.rope_type == "yarn":
             assert not self.config.apply_rope_fusion, "MLA Yarn RoPE does not support RoPE fusion"
@@ -100,6 +102,7 @@ class MultiLatentAttention(Attention):
                 beta_slow=self.config.beta_slow,
                 mscale=self.config.mscale,
                 mscale_all_dim=self.config.mscale_all_dim,
+                use_cpu_initialization=config.use_cpu_initialization
             )
         else:
             raise ValueError(
@@ -107,17 +110,28 @@ class MultiLatentAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
-        self.core_attention = build_module(
-            submodules.core_attention,
-            config=self.config,
-            layer_number=self.layer_number,
-            attn_mask_type=self.attn_mask_type,
-            attention_type=self.attention_type,
-            softmax_scale=self.softmax_scale,
-            k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
-            cp_comm_type=cp_comm_type,
-        )
+        if submodules.core_attention is DotProductAttention:
+            self.core_attention = build_module(
+                submodules.core_attention,
+                config=self.config,
+                layer_number=self.layer_number,
+                attn_mask_type=self.attn_mask_type,
+                attention_type=self.attention_type,
+                softmax_scale=self.softmax_scale,
+                cp_comm_type=cp_comm_type,
+            )
+        else:
+            self.core_attention = build_module(
+                submodules.core_attention,
+                config=self.config,
+                layer_number=self.layer_number,
+                attn_mask_type=self.attn_mask_type,
+                attention_type=self.attention_type,
+                softmax_scale=self.softmax_scale,
+                k_channels=self.q_head_dim,
+                v_channels=self.config.v_head_dim,
+                cp_comm_type=cp_comm_type,
+            )
 
         # Output.
         self.linear_proj = build_module(
@@ -314,19 +328,33 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         if self.config.q_lora_rank is not None:
-            self.q_layernorm = build_module(
-                submodules.q_layernorm,
-                hidden_size=self.config.q_lora_rank,
+            if submodules.q_layernorm is RMSNorm:
+                self.q_layernorm = build_module(
+                    submodules.q_layernorm,
+                    normalized_shape=self.config.q_lora_rank,
+                    eps=self.config.layernorm_epsilon,
+                )
+            else:
+                self.q_layernorm = build_module(
+                    submodules.q_layernorm,
+                    hidden_size=self.config.q_lora_rank,
+                    config=self.config,
+                    eps=self.config.layernorm_epsilon,
+                )
+
+        if submodules.kv_layernorm is RMSNorm:
+            self.kv_layernorm = build_module(
+                submodules.kv_layernorm,
+                normalized_shape=self.config.kv_lora_rank,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.kv_layernorm = build_module(
+                submodules.kv_layernorm,
+                hidden_size=self.config.kv_lora_rank,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
-
-        self.kv_layernorm = build_module(
-            submodules.kv_layernorm,
-            hidden_size=self.config.kv_lora_rank,
-            config=self.config,
-            eps=self.config.layernorm_epsilon,
-        )
 
     def get_query_key_value_tensors(
         self,
@@ -360,9 +388,9 @@ class MLASelfAttention(MultiLatentAttention):
         mscale = 1.0
         if self.config.rope_type == "rope":
             packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq, test_device=self.config.test_device)
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len)
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, test_device=self.config.test_device)
 
         if packed_seq_params is not None:
             cu_seqlens_q = packed_seq_params.cu_seqlens_q

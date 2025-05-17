@@ -145,7 +145,8 @@ class DotProductAttention(MegatronModule):
         matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
             (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
         )
-
+        if self.config.test_device == 'cpu':
+            matmul_input_buffer = matmul_input_buffer.to('cpu')
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
             matmul_input_buffer,
