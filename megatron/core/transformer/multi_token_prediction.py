@@ -685,8 +685,13 @@ class MultiTokenPredictionBlock(MegatronModule):
             # Calc loss for the current Multi-Token Prediction (MTP) layers.
             labels, _ = roll_tensor(labels, shifts=-1, dims=-1)
             loss_mask, num_tokens = roll_tensor(loss_mask, shifts=-1, dims=-1)
-            mtp_loss = compute_language_model_loss(labels, mtp_logits)
-            mtp_loss = loss_mask * mtp_loss
+
+            # 由于测试时直接给 compute_language_model_loss 传了 vocab_parallel_cross_entropy，因此需要手动转置。
+            # 由于 vocab_parallel_cross_entropy 内部有对输入的 view 操作，因此需要加上 .contiguous()
+            # 同样的原因，俩入参位置也得换一下
+            mtp_loss = compute_language_model_loss(mtp_logits, labels.T.contiguous())
+            mtp_loss = loss_mask * mtp_loss.T.contiguous()
+
             if self.training:
                 MTPLossLoggingHelper.save_loss_to_tracker(
                     torch.sum(mtp_loss) / num_tokens,
